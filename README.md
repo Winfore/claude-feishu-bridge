@@ -10,6 +10,7 @@
 - **Claude 操作飞书** - Claude Code 可通过 MCP 工具发送消息、创建文档、推送通知
 - **任务完成通知** - 任务执行完成后自动推送结果到飞书
 - **多会话管理** - 支持多项目、多会话并行，会话持久化与恢复
+- **进度反馈** - 执行过程中实时报告状态
 
 ## 架构
 
@@ -35,6 +36,8 @@
 - **远程控制** - 手机发指令，电脑执行代码任务
 - **会话管理** - 支持多会话、会话持久化、断线恢复
 - **MCP 工具** - Claude Code 可直接调用飞书 API
+- **进度反馈** - 执行工具时实时报告进度
+- **性能优化** - 大历史文件分页加载，Skills 缓存
 
 ## 快速开始
 
@@ -86,16 +89,41 @@ WORKSPACE_ROOT=/path/to/your/projects
 # 桥接服务配置
 BRIDGE_PORT=3100
 BRIDGE_HOST=localhost
+
+# 可选：API 调优
+MAX_TOKENS=8192
+TOOL_TIMEOUT=30000
+OUTPUT_LIMIT=10000
 ```
 
 ### 4. 启动服务
 
-```bash
-# 启动桥接服务
-npm start
+#### 开发模式
 
-# 开发模式（自动重启）
+```bash
 npm run dev
+```
+
+#### 生产模式（PM2）
+
+```bash
+# 安装 PM2（首次）
+npm install -g pm2
+
+# 启动服务
+npm run start:pm2
+
+# 查看状态
+npm run status:pm2
+
+# 查看日志
+npm run logs:pm2
+
+# 重启服务
+npm run restart:pm2
+
+# 停止服务
+npm run stop:pm2
 ```
 
 ### 5. 配置 Claude Code MCP
@@ -126,16 +154,12 @@ npm run dev
 
 | 命令 | 说明 | 示例 |
 |------|------|------|
-| `/new <项目名> <指令>` | 创建新会话执行任务 | `/new myapp 创建一个 React 项目` |
-| `/continue <会话ID> <指令>` | 继续指定会话 | `/continue cc_xxx 添加登录功能` |
-| `/sessions` | 列出所有活跃会话 | `/sessions` |
-| `/projects` | 列出所有项目 | `/projects` |
-| `/status <会话ID>` | 查看会话状态 | `/status cc_xxx` |
-| `/switch <会话ID> <项目名>` | 切换会话到其他项目 | `/switch cc_xxx backend` |
-| `/kill <会话ID>` | 终止会话 | `/kill cc_xxx` |
-| `/cd <目录>` | 切换工作目录 | `/cd src/components` |
 | `/ls` | 列出当前目录文件 | `/ls` |
+| `/cd <目录>` | 切换工作目录 | `/cd src/components` |
+| `/..` | 返回上级目录 | `/..` |
 | `/pwd` | 显示当前工作目录 | `/pwd` |
+| `/clear` | 清除上下文 | `/clear` |
+| `/context` | 查看当前上下文 | `/context` |
 | `/help` | 显示帮助 | `/help` |
 
 **直接发送消息**（不带 `/` 前缀）会自动在最近的会话中继续执行。
@@ -190,13 +214,20 @@ claude-feishu-bridge/
 │   ├── feishu-client.js      # 飞书 API 客户端
 │   ├── mcp-server.js         # MCP 工具服务
 │   ├── session/              # 会话管理模块
+│   │   ├── session-manager.js
+│   │   ├── session-storage.js
+│   │   ├── session-executor.js
+│   │   └── session-cleanup.js
 │   ├── server/handlers/      # 命令处理器
 │   ├── config/               # 配置管理
 │   ├── tools/                # 工具模块
 │   ├── skills/               # 技能模块
 │   └── utils/                # 工具函数
-├── test/                     # 测试文件
+├── test/                     # 测试文件 (Vitest)
 ├── scripts/                  # 脚本文件
+├── logs/                     # PM2 日志目录
+├── ecosystem.config.cjs      # PM2 配置
+├── vitest.config.js          # 测试配置
 ├── .env.example              # 环境变量示例
 ├── CLAUDE.md                 # 项目架构说明
 ├── DEVELOPMENT_RULES.md      # 开发规范
@@ -217,10 +248,16 @@ claude-feishu-bridge/
 | `WORKSPACE_ROOT` | 否 | 工作空间根目录 | `./workspace` |
 | `BRIDGE_PORT` | 否 | 服务端口 | `3100` |
 | `BRIDGE_HOST` | 否 | 服务主机 | `localhost` |
-| `SESSION_TIMEOUT` | 否 | 会话超时时间(ms) | `1800000` (30分钟) |
+| `SESSION_TIMEOUT` | 否 | 会话超时时间(ms) | `7200000` (2小时) |
 | `ALLOWED_USERS` | 否 | 允许的用户ID | 空(允许所有) |
 | `ADMIN_USERS` | 否 | 管理员用户ID | - |
 | `NOTIFY_CHAT_ID` | 否 | 默认通知群聊ID | - |
+| `LOG_LEVEL` | 否 | 日志级别 | `INFO` |
+| `MAX_TOKENS` | 否 | Claude API max_tokens | `8192` |
+| `TOOL_TIMEOUT` | 否 | 工具执行超时(ms) | `30000` |
+| `OUTPUT_LIMIT` | 否 | 输出截断长度 | `10000` |
+| `SEARCH_FILES_LIMIT` | 否 | 文件搜索结果限制 | `100` |
+| `SEARCH_CONTENT_LIMIT` | 否 | 内容搜索结果限制 | `50` |
 
 ### 安全配置
 
@@ -246,7 +283,14 @@ ADMIN_USERS=ou_admin
 ### 运行测试
 
 ```bash
+# 运行所有测试
 npm test
+
+# 监听模式
+npm run test:watch
+
+# 查看覆盖率
+npm run test:coverage
 ```
 
 ### 开发规范
@@ -260,6 +304,49 @@ npm test
 ### 项目架构
 
 详见 [CLAUDE.md](./CLAUDE.md)
+
+## PM2 生产部署
+
+### 方式一：使用 npm 脚本
+
+```bash
+# 安装 PM2
+npm install -g pm2
+
+# 启动
+npm run start:pm2
+
+# 管理命令
+npm run status:pm2    # 查看状态
+npm run logs:pm2      # 查看日志
+npm run restart:pm2   # 重启
+npm run stop:pm2      # 停止
+```
+
+### 方式二：使用脚本
+
+```bash
+# Linux/Mac
+chmod +x scripts/start.sh scripts/stop.sh
+./scripts/start.sh
+./scripts/stop.sh
+```
+
+### PM2 配置说明
+
+配置文件：`ecosystem.config.cjs`
+
+- **内存限制**：500MB 自动重启
+- **定时重启**：每天凌晨 4 点
+- **日志位置**：`./logs/`
+- **自动重启**：最多 10 次，指数退避
+
+### 开机自启
+
+```bash
+pm2 startup
+pm2 save
+```
 
 ## 故障排查
 
@@ -277,7 +364,7 @@ npm test
 ### 会话无法继续
 
 - 检查 `sessions` 目录是否存在
-- 确认 Claude Code 已正确安装
+- 查看日志中的错误信息
 
 ## License
 
@@ -298,6 +385,7 @@ A bridge service enabling bidirectional integration between Claude Code and Feis
 - **Claude Operates Feishu** - Claude Code can send messages, create documents, and push notifications via MCP tools
 - **Task Completion Notifications** - Automatic push notifications when tasks complete
 - **Multi-session Management** - Support for multiple projects and sessions with persistence and recovery
+- **Progress Feedback** - Real-time status reports during execution
 
 ## Key Advantages
 
@@ -305,6 +393,7 @@ A bridge service enabling bidirectional integration between Claude Code and Feis
 - **Remote Control** - Send commands from mobile, execute on desktop
 - **Session Management** - Multiple sessions, persistence, auto-recovery
 - **MCP Tools** - Claude Code can directly call Feishu APIs
+- **Performance Optimized** - Paginated history loading, Skills caching
 
 ## Quick Start
 
@@ -336,7 +425,29 @@ cp .env.example .env
 ### 3. Start
 
 ```bash
-npm start
+# Development
+npm run dev
+
+# Production (PM2)
+npm install -g pm2
+npm run start:pm2
+```
+
+### 4. PM2 Commands
+
+```bash
+npm run status:pm2    # Check status
+npm run logs:pm2      # View logs
+npm run restart:pm2   # Restart
+npm run stop:pm2      # Stop
+```
+
+## Testing
+
+```bash
+npm test              # Run tests
+npm run test:watch    # Watch mode
+npm run test:coverage # Coverage report
 ```
 
 ## License

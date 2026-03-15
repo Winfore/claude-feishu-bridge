@@ -3,7 +3,7 @@
  * 负责会话的保存、加载、历史记录管理
  */
 
-import { readFile, writeFile, mkdir, readdir, unlink } from 'fs/promises';
+import { readFile, writeFile, mkdir, readdir, unlink, open, stat } from 'fs/promises';
 import { join } from 'path';
 import { existsSync, createReadStream } from 'fs';
 import { createInterface } from 'readline';
@@ -88,13 +88,24 @@ export class SessionStorage {
   }
 
   /**
-   * 加载会话历史记录
+   * 加载会话历史记录（支持分页）
+   * @param {string} sessionId - 会话ID
+   * @param {object} options - 选项
+   * @param {number} options.limit - 最大加载消息数（0 表示全部）
+   * @param {number} options.offset - 跳过的消息数
+   * @param {boolean} options.tailOnly - 只加载最后 N 条（推荐用于恢复会话）
    */
-  async loadHistory(sessionId) {
+  async loadHistory(sessionId, options = {}) {
+    const { limit = 0, offset = 0, tailOnly = false } = options;
+
     try {
       const historyPath = this.getHistoryPath(sessionId);
       if (!existsSync(historyPath)) {
         return [];
+      }
+
+      if (tailOnly && limit > 0) {
+        return await this.loadHistoryTail(sessionId, limit);
       }
 
       const history = [];
@@ -104,10 +115,23 @@ export class SessionStorage {
         crlfDelay: Infinity
       });
 
+      let skipped = 0;
+      let loaded = 0;
+
       for await (const line of rl) {
         if (line.trim()) {
+          if (skipped < offset) {
+            skipped++;
+            continue;
+          }
+
           try {
             history.push(JSON.parse(line));
+            loaded++;
+
+            if (limit > 0 && loaded >= limit) {
+              break;
+            }
           } catch (e) {
             logger.warn(`解析历史记录行失败: ${sessionId}`, e);
           }
@@ -119,6 +143,110 @@ export class SessionStorage {
     } catch (error) {
       logger.error(`加载历史记录失败: ${sessionId}`, error);
       return [];
+    }
+  }
+
+  /**
+   * 高效加载最后 N 条历史记录
+   * 使用逆向读取，避免加载整个文件
+   */
+  async loadHistoryTail(sessionId, count) {
+    try {
+      const historyPath = this.getHistoryPath(sessionId);
+      if (!existsSync(historyPath)) {
+        return [];
+      }
+
+      const stats = await stat(historyPath);
+      const fileSize = stats.size;
+
+      if (fileSize < 100 * 1024) {
+        const all = await this.loadHistory(sessionId);
+        return all.slice(-count);
+      }
+
+      const fd = await open(historyPath, 'r');
+      const bufferSize = Math.min(64 * 1024, fileSize);
+      const buffer = Buffer.alloc(bufferSize);
+
+      const lines = [];
+      let position = fileSize;
+      let remainingData = '';
+
+      try {
+        while (position > 0 && lines.length < count) {
+          const readSize = Math.min(bufferSize, position);
+          position -= readSize;
+
+          const { bytesRead } = await fd.read(buffer, 0, readSize, position);
+          const chunk = buffer.slice(0, bytesRead).toString('utf-8') + remainingData;
+
+          const chunkLines = chunk.split('\n');
+          remainingData = chunkLines[0];
+
+          for (let i = chunkLines.length - 1; i >= 1 && lines.length < count; i--) {
+            const line = chunkLines[i].trim();
+            if (line) {
+              try {
+                lines.unshift(JSON.parse(line));
+              } catch (e) {
+                // 忽略解析错误
+              }
+            }
+          }
+        }
+
+        if (remainingData.trim() && lines.length < count) {
+          try {
+            lines.unshift(JSON.parse(remainingData.trim()));
+          } catch (e) {
+            // 忽略
+          }
+        }
+      } finally {
+        await fd.close();
+      }
+
+      logger.debug(`尾部加载历史记录: ${sessionId}, ${lines.length} 条消息`);
+      return lines;
+    } catch (error) {
+      logger.error(`尾部加载历史记录失败: ${sessionId}`, error);
+      return [];
+    }
+  }
+
+  /**
+   * 获取历史记录统计信息
+   */
+  async getHistoryStats(sessionId) {
+    try {
+      const historyPath = this.getHistoryPath(sessionId);
+      if (!existsSync(historyPath)) {
+        return { exists: false, messageCount: 0, fileSize: 0 };
+      }
+
+      const stats = await stat(historyPath);
+
+      let lineCount = 0;
+      const fileStream = createReadStream(historyPath);
+      const rl = createInterface({
+        input: fileStream,
+        crlfDelay: Infinity
+      });
+
+      for await (const line of rl) {
+        if (line.trim()) lineCount++;
+      }
+
+      return {
+        exists: true,
+        messageCount: lineCount,
+        fileSize: stats.size,
+        lastModified: stats.mtime
+      };
+    } catch (error) {
+      logger.error(`获取历史统计失败: ${sessionId}`, error);
+      return { exists: false, messageCount: 0, fileSize: 0 };
     }
   }
 

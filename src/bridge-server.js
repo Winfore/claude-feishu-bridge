@@ -10,7 +10,7 @@
 import { FeishuLongPollClient } from './feishu-longpoll.js';
 import { SessionManager } from './session/session-manager.js';
 import { logger } from './utils/logger.js';
-import { lsHandler, cdHandler, upHandler, pwdHandler, helpHandler } from './server/handlers/index.js';
+import { lsHandler, cdHandler, upHandler, pwdHandler, helpHandler, clearHandler, contextHandler } from './server/handlers/index.js';
 import { readdir, stat } from 'fs/promises';
 import { join, dirname, resolve } from 'path';
 import 'dotenv/config';
@@ -35,7 +35,8 @@ export class BridgeServer {
       baseURL: config.baseURL,
       model: config.model,
       onSessionEnd: (session) => this.handleSessionEnd(session),
-      onToolNeedsAuth: (session, toolUse) => this.handleToolNeedsAuth(session, toolUse)
+      onToolNeedsAuth: (session, toolUse) => this.handleToolNeedsAuth(session, toolUse),
+      onProgress: (sessionId, progress) => this.handleProgress(sessionId, progress)
     });
 
     // 消息处理器映射
@@ -59,6 +60,10 @@ export class BridgeServer {
     // 防止重复处理消息（记录最近处理的消息ID）
     this.processedMessages = new Set();
     this.maxProcessedMessages = 100; // 最多记录100条消息ID
+
+    // 进度更新节流（同一会话每 5 秒最多发送一次）
+    this.progressThrottle = new Map(); // sessionId -> lastProgressTime
+    this.progressThrottleMs = 5000;
   }
 
   /**
@@ -71,8 +76,7 @@ export class BridgeServer {
       const name = userInfo.name || userInfo.en_name || `user_${userId.slice(-8)}`;
       return name.replace(/\s+/g, '_').replace(/[^\w\u4e00-\u9fa5-]/g, '');
     } catch (error) {
-      console.error('获取用户信息失败:', error);
-      // 降级方案：使用用户ID的后8位
+      logger.error('获取用户信息失败:', error);
       return `user_${userId.slice(-8)}`;
     }
   }
@@ -122,6 +126,8 @@ export class BridgeServer {
     this.registerHandler('..', (ctx) => upHandler(ctx, handlerContext));
     this.registerHandler('pwd', (ctx) => pwdHandler(ctx, handlerContext));
     this.registerHandler('help', () => helpHandler());
+    this.registerHandler('clear', (ctx) => clearHandler(ctx, handlerContext));
+    this.registerHandler('context', (ctx) => contextHandler(ctx, handlerContext));
   }
 
   /**
@@ -151,7 +157,7 @@ export class BridgeServer {
 
     // 权限检查
     if (this.allowedUsers && !this.allowedUsers.includes(senderId)) {
-      console.log(`拒绝用户 ${senderId} 的请求`);
+      logger.warn(`拒绝用户 ${senderId} 的请求`);
       return;
     }
 
@@ -160,7 +166,7 @@ export class BridgeServer {
 
     // 防止重复处理同一条消息
     if (this.processedMessages.has(messageId)) {
-      console.log(`跳过已处理的消息: ${messageId}`);
+      logger.debug(`跳过已处理的消息: ${messageId}`);
       return;
     }
 
@@ -225,7 +231,7 @@ export class BridgeServer {
       }
 
     } catch (error) {
-      console.error('处理消息失败:', error);
+      logger.error('处理消息失败:', error);
       await this.feishu.replyMessage(messageId, 'text', {
         text: `❌ 处理失败: ${error.message}`
       });
@@ -264,25 +270,27 @@ export class BridgeServer {
    * 用户隔离：每个用户有独立的上下文和会话
    */
   async handleUserMessage(chatId, messageId, senderId, content) {
-    // 确保用户上下文已初始化
     const userCtx = await this.ensureUserContext(senderId, chatId);
     const workspaceRoot = this.config.workspaceRoot;
 
-    // 查找或创建会话
     let session = userCtx.sessionId ? this.sessions.getSession(userCtx.sessionId) : null;
 
-    // 检查会话状态
+    // 如果内存中没有会话，尝试从磁盘恢复
+    if (!session && userCtx.sessionId) {
+      session = await this.sessions.restoreSession(userCtx.sessionId);
+      if (session) {
+        logger.info(`从磁盘恢复会话: ${session.id}`);
+      }
+    }
+
     if (session && session.status === 'running') {
-      // 会话正在执行中（可能在等待授权），给出友好提示
       await this.feishu.sendText(chatId, '⏳ 你有操作正在等待授权，请先处理上方的授权请求');
       return;
     }
 
-    // 发送"正在思考"提示
     await this.feishu.sendText(chatId, '🤔 正在思考...');
 
     if (!session || session.status === 'error') {
-      // 没有会话或会话出错，创建新会话
       try {
         session = await this.sessions.createSession({
           source: 'feishu',
@@ -294,18 +302,17 @@ export class BridgeServer {
         userCtx.sessionId = session.id;
         this.userContext.set(senderId, userCtx);
       } catch (error) {
-        console.error(`[handleUserMessage] 创建会话失败:`, error);
+        logger.error('[handleUserMessage] 创建会话失败:', error);
         await this.feishu.replyMessage(messageId, 'text', {
           text: `❌ 创建会话失败: ${error.message}`
         });
         return;
       }
     } else {
-      // 继续现有会话
       try {
         await this.sessions.continueSession(session.id, content);
       } catch (error) {
-        console.error(`[handleUserMessage] 继续会话失败:`, error);
+        logger.error('[handleUserMessage] 继续会话失败:', error);
         await this.feishu.replyMessage(messageId, 'text', {
           text: `❌ 继续会话失败: ${error.message}`
         });
@@ -352,26 +359,26 @@ export class BridgeServer {
    * 会话结束回调
    */
   async handleSessionEnd(session) {
-    console.log(`会话 ${session.id} 结束，状态: ${session.status}`);
+    logger.info(`会话 ${session.id} 结束，状态: ${session.status}`);
 
     if (session.chatId) {
       if ((session.status === 'completed' || session.status === 'idle') && session.output) {
         if (this.isRecentlySent(session.chatId, session.output)) {
-          console.log(`[handleSessionEnd] 跳过重复消息，chatId=${session.chatId}`);
+          logger.debug(`[handleSessionEnd] 跳过重复消息，chatId=${session.chatId}`);
           return;
         }
 
         try {
           await this.feishu.sendText(session.chatId, session.output);
-          console.log(`[handleSessionEnd] 消息已发送，chatId=${session.chatId}`);
+          logger.debug(`[handleSessionEnd] 消息已发送，chatId=${session.chatId}`);
         } catch (error) {
-          console.error('发送回复失败:', error);
+          logger.error('发送回复失败:', error);
         }
       } else if (session.status === 'error') {
         try {
           await this.feishu.sendText(session.chatId, `❌ ${session.output}`);
         } catch (error) {
-          console.error('发送错误信息失败:', error);
+          logger.error('发送错误信息失败:', error);
         }
       }
     }
@@ -381,8 +388,8 @@ export class BridgeServer {
    * 工具需要授权时的回调
    */
   async handleToolNeedsAuth(session, toolUse) {
-    console.log(`[handleToolNeedsAuth] 工具 ${toolUse.name} 需要授权`);
-    console.log(`[handleToolNeedsAuth] 会话: ${session.id}, 聊天: ${session.chatId}`);
+    logger.info(`[handleToolNeedsAuth] 工具 ${toolUse.name} 需要授权`);
+    logger.debug(`[handleToolNeedsAuth] 会话: ${session.id}, 聊天: ${session.chatId}`);
 
     try {
       await this.feishu.sendToolAuthCard(
@@ -391,10 +398,41 @@ export class BridgeServer {
         toolUse,
         session.workingDir
       );
-      console.log(`[handleToolNeedsAuth] 授权卡片已发送`);
+      logger.debug('[handleToolNeedsAuth] 授权卡片已发送');
     } catch (error) {
-      console.error(`[handleToolNeedsAuth] 发送授权卡片失败:`, error);
+      logger.error('[handleToolNeedsAuth] 发送授权卡片失败:', error);
       this.sessions.resumeWithAuth(session.id, toolUse.id, false, session.workingDir);
+    }
+  }
+
+  /**
+   * 处理执行进度
+   */
+  async handleProgress(sessionId, progress) {
+    const session = this.sessions.getSession(sessionId);
+    if (!session || !session.chatId) return;
+
+    const now = Date.now();
+    const lastTime = this.progressThrottle.get(sessionId) || 0;
+
+    if (now - lastTime < this.progressThrottleMs) {
+      return;
+    }
+
+    this.progressThrottle.set(sessionId, now);
+
+    const shouldNotify = ['thinking', 'tool_call', 'mcp_call'].includes(progress.stage);
+
+    if (shouldNotify) {
+      const messages = {
+        thinking: '🤔 正在思考...',
+        tool_call: progress.needsAuth
+          ? `🔒 工具需要授权: ${progress.tool}`
+          : `🔧 执行工具: ${progress.tool}`,
+        mcp_call: `🔌 调用服务: ${progress.tool}`
+      };
+
+      logger.session(sessionId, `进度: ${progress.stage}`, progress);
     }
   }
 
@@ -402,6 +440,14 @@ export class BridgeServer {
    * 启动服务（长连接模式）
    */
   async start() {
+    process.on('uncaughtException', (error) => {
+      logger.error('Uncaught Exception:', error);
+    });
+
+    process.on('unhandledRejection', (reason, promise) => {
+      logger.error('Unhandled Rejection at:', promise, 'reason:', reason);
+    });
+
     await this.sessions.loadPersistedSessions();
 
     await this.feishu.start(async (event) => {
@@ -412,60 +458,55 @@ export class BridgeServer {
       await this.handleCardAction(event);
     });
 
-    console.log('🌉 Bridge Server 已启动（长连接模式）');
-    console.log('📱 无需公网域名，直接通过 WebSocket 连接飞书');
-    console.log('👤 用户隔离模式：每个用户独立会话');
-    console.log('🔒 工作空间独占：同一项目只能被一个用户使用');
+    logger.info('🌉 Bridge Server 已启动（长连接模式）');
+    logger.info('📱 无需公网域名，直接通过 WebSocket 连接飞书');
+    logger.info('👤 用户隔离模式：每个用户独立会话');
+    logger.info('🔒 工作空间独占：同一项目只能被一个用户使用');
   }
 
   /**
    * 处理卡片按钮点击动作
    */
   async handleCardAction(event) {
-    console.log('处理卡片动作:', JSON.stringify(event, null, 2));
+    logger.debug('处理卡片动作:', JSON.stringify(event, null, 2));
 
     const { action, token } = event;
     const chatId = event.context?.open_chat_id || event.chat_id;
 
     if (!chatId) {
-      console.log('无法获取 chatId');
+      logger.warn('无法获取 chatId');
       return;
     }
 
     if (!action || !action.value) {
-      console.log('卡片动作没有 value');
+      logger.warn('卡片动作没有 value');
       return;
     }
 
     const actionValue = action.value;
-    console.log('动作值:', actionValue);
+    logger.debug('动作值:', actionValue);
 
     try {
       if (actionValue.action === 'approve_tool') {
         const { sessionId, toolCallId, toolName } = actionValue;
-        console.log(`[handleCardAction] 批准工具: ${toolName}, 会话: ${sessionId}`);
+        logger.info(`[handleCardAction] 批准工具: ${toolName}, 会话: ${sessionId}`);
 
-        // 调试：列出所有活跃会话
         const allSessions = this.sessions.listAllSessions();
-        console.log(`[handleCardAction] 当前活跃会话: ${allSessions.map(s => `${s.id}(${s.status})`).join(', ')}`);
+        logger.debug(`[handleCardAction] 当前活跃会话: ${allSessions.map(s => `${s.id}(${s.status})`).join(', ')}`);
 
         const session = this.sessions.getSession(sessionId);
         if (!session) {
-          // 会话不存在，可能已经完成或过期
-          console.log(`[handleCardAction] 会话 ${sessionId} 不存在`);
+          logger.warn(`[handleCardAction] 会话 ${sessionId} 不存在`);
           await this.feishu.sendText(chatId, `⚠️ 会话已结束，此授权请求已失效`);
           return;
         }
 
-        // 检查是否已经处理过（幂等性检查）
         const pendingTool = this.sessions.getPendingAuth(sessionId, toolCallId);
         if (!pendingTool) {
-          // 已经处理过，静默忽略（飞书可能重复发送事件）
-          console.log(`[handleCardAction] 授权请求已处理，跳过: ${toolCallId}`);
+          logger.debug(`[handleCardAction] 授权请求已处理，跳过: ${toolCallId}`);
           return;
         }
 
-        // 执行授权
         const success = await this.sessions.resumeWithAuth(sessionId, toolCallId, true, session.workingDir);
         if (success) {
           await this.feishu.sendText(chatId, `✅ 已批准执行: ${toolName}`);
@@ -475,7 +516,7 @@ export class BridgeServer {
 
       } else if (actionValue.action === 'reject_tool') {
         const { sessionId, toolCallId, toolName } = actionValue;
-        console.log(`[handleCardAction] 拒绝工具: ${toolName}, 会话: ${sessionId}`);
+        logger.info(`[handleCardAction] 拒绝工具: ${toolName}, 会话: ${sessionId}`);
 
         const session = this.sessions.getSession(sessionId);
         if (!session) {
@@ -483,15 +524,12 @@ export class BridgeServer {
           return;
         }
 
-        // 检查是否已经处理过（幂等性检查）
         const pendingTool = this.sessions.getPendingAuth(sessionId, toolCallId);
         if (!pendingTool) {
-          // 已经处理过，静默忽略（飞书可能重复发送事件）
-          console.log(`[handleCardAction] 授权请求已处理，跳过: ${toolCallId}`);
+          logger.debug(`[handleCardAction] 授权请求已处理，跳过: ${toolCallId}`);
           return;
         }
 
-        // 执行拒绝
         const success = await this.sessions.resumeWithAuth(sessionId, toolCallId, false, session.workingDir);
         if (success) {
           await this.feishu.sendText(chatId, `❌ 已拒绝执行: ${toolName}`);
@@ -500,10 +538,10 @@ export class BridgeServer {
         }
 
       } else {
-        console.log('未知卡片动作:', actionValue);
+        logger.warn('未知卡片动作:', actionValue);
       }
     } catch (error) {
-      console.error('处理卡片动作失败:', error);
+      logger.error('处理卡片动作失败:', error);
       await this.feishu.sendText(chatId, `❌ 处理失败: ${error.message}`);
     }
   }
@@ -513,6 +551,6 @@ export class BridgeServer {
    */
   async stop() {
     await this.feishu.stop();
-    console.log('Bridge Server 已停止');
+    logger.info('Bridge Server 已停止');
   }
 }

@@ -18,6 +18,7 @@ export class SessionManager {
     this.workspaceRoot = config.workspaceRoot || process.cwd();
     this.onSessionEnd = config.onSessionEnd || (() => {});
     this.onToolNeedsAuth = config.onToolNeedsAuth || (() => {});
+    this.onProgress = config.onProgress || (() => {});
 
     // 等待授权的工具调用
     this.pendingAuth = new Map(); // sessionId -> { toolCallId -> { resolve, reject, toolUse } }
@@ -27,7 +28,15 @@ export class SessionManager {
     this.executor = new SessionExecutor({
       anthropicApiKey: config.anthropicApiKey,
       baseURL: config.baseURL,
-      model: config.model
+      model: config.model,
+      maxTokens: config.maxTokens,
+      toolTimeout: config.toolTimeout,
+      outputLimit: config.outputLimit,
+      searchFilesLimit: config.searchFilesLimit,
+      searchContentLimit: config.searchContentLimit,
+      onProgress: (sessionId, progress) => {
+        this.onProgress(sessionId, progress);
+      }
     });
     this.cleanup = new SessionCleanup(this, this.storage, {
       sessionTimeout: config.sessionTimeout,
@@ -48,7 +57,10 @@ export class SessionManager {
     logger.info(`发现 ${persistedSessions.length} 个持久化会话`);
 
     for (const meta of persistedSessions) {
-      const history = await this.storage.loadHistory(meta.sessionId);
+      const stats = await this.storage.getHistoryStats(meta.sessionId);
+      const history = stats.messageCount > 100
+        ? await this.storage.loadHistory(meta.sessionId, { tailOnly: true, limit: 50 })
+        : await this.storage.loadHistory(meta.sessionId);
 
       const session = {
         id: meta.sessionId,
@@ -72,16 +84,16 @@ export class SessionManager {
     return persistedSessions.length;
   }
 
-  /**
-   * 恢复单个会话
-   */
   async restoreSession(sessionId) {
     const meta = await this.storage.loadMeta(sessionId);
     if (!meta) {
       return null;
     }
 
-    const history = await this.storage.loadHistory(sessionId);
+    const stats = await this.storage.getHistoryStats(sessionId);
+    const history = stats.messageCount > 100
+      ? await this.storage.loadHistory(sessionId, { tailOnly: true, limit: 50 })
+      : await this.storage.loadHistory(sessionId);
 
     const session = {
       id: sessionId,
@@ -266,6 +278,8 @@ export class SessionManager {
     session.startTime = Date.now();
     session.lastActivityTime = Date.now();
 
+    this.executor.reportProgress(session.id, 'thinking', { prompt: prompt.slice(0, 100) });
+
     try {
       // 添加用户消息到历史
       session.messages.push({
@@ -282,7 +296,7 @@ export class SessionManager {
         // 调用 Claude API
         const response = await this.executor.anthropic.messages.create({
           model: this.executor.model,
-          max_tokens: 8192,
+          max_tokens: this.executor.maxTokens,
           messages: session.messages,
           system: this.executor.buildSystemPrompt(session.workingDir),
           tools: allTools
@@ -344,14 +358,17 @@ export class SessionManager {
 
           // 检查是否为 MCP 工具
           if (this.executor.isMCPTool(toolUse.name)) {
+            this.executor.reportProgress(session.id, 'mcp_call', { tool: toolUse.name });
             try {
               const result = await this.executor.callMCPTool(toolUse.name, toolUse.input);
+              this.executor.reportProgress(session.id, 'tool_result', { tool: toolUse.name, success: true });
               toolResults.push({
                 type: 'tool_result',
                 tool_use_id: toolUse.id,
                 content: typeof result === 'string' ? result : JSON.stringify(result)
               });
             } catch (error) {
+              this.executor.reportProgress(session.id, 'tool_result', { tool: toolUse.name, success: false, error: error.message });
               toolResults.push({
                 type: 'tool_result',
                 tool_use_id: toolUse.id,
@@ -360,11 +377,14 @@ export class SessionManager {
               });
             }
           } else if (this.executor.needsAuth(toolUse.name)) {
+            this.executor.reportProgress(session.id, 'tool_call', { tool: toolUse.name, needsAuth: true });
             // 内置工具需要授权
             authNeededTools.push(toolUse);
           } else {
+            this.executor.reportProgress(session.id, 'tool_call', { tool: toolUse.name });
             // 内置工具自动执行
             const result = await this.executor.executeTool(toolUse.name, toolUse.input, session.workingDir);
+            this.executor.reportProgress(session.id, 'tool_result', { tool: toolUse.name, success: result.success });
             toolResults.push({
               type: 'tool_result',
               tool_use_id: toolUse.id,
@@ -514,6 +534,15 @@ export class SessionManager {
    */
   getSession(sessionId) {
     return this.sessions.get(sessionId);
+  }
+
+  /**
+   * 获取等待授权的工具调用
+   */
+  getPendingAuth(sessionId, toolCallId) {
+    const sessionPending = this.pendingAuth.get(sessionId);
+    if (!sessionPending) return null;
+    return sessionPending.get(toolCallId);
   }
 
   /**

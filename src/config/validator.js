@@ -54,6 +54,13 @@ export function loadConfig(envConfig = {}) {
     anthropicApiKey: envConfig.ANTHROPIC_API_KEY,
     baseURL: envConfig.ANTHROPIC_BASE_URL,
     model: envConfig.CLAUDE_MODEL || DEFAULTS.model,
+    maxTokens: parseInt(envConfig.MAX_TOKENS) || DEFAULTS.maxTokens,
+
+    // 工具执行配置
+    toolTimeout: parseInt(envConfig.TOOL_TIMEOUT) || DEFAULTS.toolTimeout,
+    outputLimit: parseInt(envConfig.OUTPUT_LIMIT) || DEFAULTS.outputLimit,
+    searchFilesLimit: parseInt(envConfig.SEARCH_FILES_LIMIT) || DEFAULTS.searchFilesLimit,
+    searchContentLimit: parseInt(envConfig.SEARCH_CONTENT_LIMIT) || DEFAULTS.searchContentLimit,
 
     // 会话配置
     sessionTimeout: parseInt(envConfig.SESSION_TIMEOUT) || DEFAULTS.sessionTimeout,

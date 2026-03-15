@@ -18,10 +18,44 @@ const SKILL_PATHS = [
   path.join(process.cwd(), '.claude', 'skills')
 ];
 
+// 缓存相关常量
+const CACHE_TTL = 60 * 1000; // 缓存有效期：60 秒
+let skillsCache = null;
+let cacheTimestamp = 0;
+
 /**
- * 加载所有 skills
+ * 清除缓存（用于强制刷新）
  */
-export async function loadAllSkills() {
+export function clearSkillsCache() {
+  skillsCache = null;
+  cacheTimestamp = 0;
+}
+
+/**
+ * 加载所有 skills（带缓存）
+ * @param {Object} options - 选项
+ * @param {boolean} options.forceRefresh - 强制刷新缓存
+ */
+export async function loadAllSkills(options = {}) {
+  const { forceRefresh = false } = options;
+
+  // 如果有缓存且未过期，直接返回
+  if (!forceRefresh && skillsCache && Date.now() - cacheTimestamp < CACHE_TTL) {
+    return skillsCache;
+  }
+
+  // 重新加载
+  const skills = await loadAllSkillsFromDisk();
+  skillsCache = skills;
+  cacheTimestamp = Date.now();
+
+  return skills;
+}
+
+/**
+ * 从磁盘加载所有 skills
+ */
+async function loadAllSkillsFromDisk() {
   const skills = [];
   const loaded = new Set(); // 防止重复加载
 
@@ -191,4 +225,10 @@ export function parseSkillInvocation(userInput) {
     skillName: match[1],
     arguments: match[2] || ''
   };
+}
+
+// 如果直接运行此文件，输出所有 skills（用于调试）
+if (import.meta.url === `file://${process.argv[1].replace(/\\/g, '/')}`) {
+  const skills = await loadAllSkills();
+  console.log(JSON.stringify(skills, null, 2));
 }

@@ -16,8 +16,42 @@ Claude Code 飞书桥接服务 - A bridge service enabling bidirectional integra
 npm start          # Start the bridge server (production)
 npm run dev        # Start with auto-reload (--watch flag)
 npm run mcp        # Run the MCP server standalone
-npm test           # Run component tests (Feishu connection + session manager)
+npm test           # Run all tests (Vitest)
+npm run test:watch # Run tests in watch mode
+npm run test:coverage # Run tests with coverage report
 ```
+
+### PM2 生产部署
+
+```bash
+# 安装 PM2（首次）
+npm install -g pm2
+
+# 启动服务
+npm run start:pm2
+
+# 或使用启动脚本
+./scripts/start.sh
+
+# 查看状态
+npm run status:pm2
+
+# 查看日志
+npm run logs:pm2
+
+# 重启服务
+npm run restart:pm2
+
+# 停止服务
+npm run stop:pm2
+```
+
+**PM2 常用命令**：
+- `pm2 monit` - 实时监控
+- `pm2 logs` - 查看日志
+- `pm2 flush` - 清空日志
+- `pm2 save` - 保存进程列表
+- `pm2 startup` - 设置开机自启
 
 ## Architecture
 
@@ -42,7 +76,13 @@ src/
 │       ├── cd-handler.js   # /cd command - change directory
 │       ├── up-handler.js   # /.. command - go up
 │       ├── pwd-handler.js  # /pwd command - print working directory
+│       ├── clear-handler.js # /clear command - clear context
+│       ├── context-handler.js # /context command - show context
 │       └── help-handler.js # /help command - show help
+├── tools/                  # Tool modules
+│   └── skill-tool.js       # Skill loading tool
+├── skills/                 # Skill loader
+│   └── skill-loader.js     # Load and parse SKILL.md files
 ├── feishu-longpoll.js      # Feishu WebSocket long-polling client
 ├── feishu-client.js        # Feishu API client
 ├── mcp-server.js           # MCP server exposing Feishu tools to Claude
@@ -89,6 +129,21 @@ Sessions are stored in `./sessions/` via `SessionStorage`:
 
 On restart, `SessionManager.loadPersistedSessions()` restores sessions from meta files.
 
+**Performance Optimization:**
+- Large history files (>100 messages) only load the last 50 messages
+- `loadHistoryTail()` efficiently reads the end of large files
+- `getHistoryStats()` provides quick metadata without parsing
+
+### Progress Feedback
+
+During execution, progress is reported at key stages:
+- `thinking` - Starting to process prompt
+- `tool_call` - About to execute a built-in tool
+- `mcp_call` - About to call an MCP tool
+- `tool_result` - Tool execution completed
+
+Progress updates are throttled to once per 5 seconds per session to avoid message spam.
+
 ## Configuration
 
 Required environment variables (`.env`):
@@ -104,10 +159,11 @@ FEISHU_VERIFICATION_TOKEN  # (optional) For callback verification
 ANTHROPIC_API_KEY    # Anthropic API key (required)
 ANTHROPIC_BASE_URL   # (optional) Custom API endpoint for proxy
 CLAUDE_MODEL         # (optional) Model name, default: claude-opus-4-20250514
+MAX_TOKENS           # (optional) max_tokens, default: 8192
 
 # Workspace Configuration
 WORKSPACE_ROOT       # Root directory for all projects (e.g., D:/project)
-SESSION_TIMEOUT      # (optional) Session timeout in ms, default: 1800000 (30 min)
+SESSION_TIMEOUT      # (optional) Session timeout in ms, default: 7200000 (2 hours)
 SESSIONS_DIR         # (optional) Session storage directory, default: ./sessions
 
 # Server Configuration
@@ -123,6 +179,12 @@ NOTIFY_CHAT_ID       # Default chat for feishu_notify tool
 
 # Logging
 LOG_LEVEL            # (optional) Log level: DEBUG, INFO, WARN, ERROR (default: INFO)
+
+# Tool Execution (optional)
+TOOL_TIMEOUT         # Tool execution timeout in ms, default: 30000
+OUTPUT_LIMIT         # Output truncation limit, default: 10000
+SEARCH_FILES_LIMIT   # File search result limit, default: 100
+SEARCH_CONTENT_LIMIT # Content search result limit, default: 50
 ```
 
 Configuration is validated on startup via `config/validator.js`. Missing required fields will cause startup failure with clear error messages.
@@ -243,12 +305,18 @@ Add method to `FeishuLongPollClient` class in `feishu-longpoll.js`. All methods 
 - Any modification (new feature, bug fix, refactoring) must include tests
 - Tests should cover core logic and edge cases
 - Test files should be placed in `test/` directory
+- Test framework: Vitest
 
 **Rule 2: All tests must pass after modifications**
 - Run `npm test` before committing
 - All tests must pass (100% pass rate required)
 - Fix failing tests or update them to match new behavior
 - Do not commit code that breaks tests
+
+**Current Test Status:**
+- Test files: 5
+- Test cases: 87
+- Coverage: ~20%
 
 **Workflow:**
 ```bash
@@ -297,6 +365,21 @@ throw new SessionError('Session not found', { sessionId });
 throw new ConfigError('Missing required config', { field: 'ANTHROPIC_API_KEY' });
 throw new ToolExecutionError('Tool execution failed', { toolName, error: err.message });
 ```
+
+### Security
+
+**Path Traversal Protection:**
+- All file paths are normalized before checking
+- Paths outside working directory are rejected
+- Cross-drive paths (Windows) are detected
+
+**Dangerous Command Blacklist:**
+The `execute_command` tool blocks dangerous commands:
+- `rm -rf /` - Recursive root delete
+- Fork bombs
+- Disk overwrite commands
+- `mkfs` formatting
+- `dd` to device files
 
 ## Refactoring History
 

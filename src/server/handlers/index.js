@@ -8,3 +8,5 @@ export { cdHandler } from './cd-handler.js';
 export { upHandler } from './up-handler.js';
 export { pwdHandler } from './pwd-handler.js';
 export { helpHandler } from './help-handler.js';
+export { clearHandler } from './clear-handler.js';
+export { contextHandler } from './context-handler.js';

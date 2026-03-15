@@ -9,10 +9,7 @@
 - 测试应覆盖修改的核心逻辑和边界情况
 - 测试文件应放在 `test/` 目录下，与源文件对应
 
-**测试类型：**
-- **单元测试**：测试单个模块或函数
-- **集成测试**：测试模块间的协作
-- **端到端测试**：测试完整的功能流程
+**测试框架：** Vitest
 
 **示例：**
 ```javascript
@@ -27,8 +24,8 @@ export async function statusHandler(ctx, { sessions }) {
 }
 
 // 必须添加：对应的测试
-// test/handlers/status-handler.test.js
-import { statusHandler } from '../../src/server/handlers/status-handler.js';
+// test/handlers/handlers.test.js
+import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 
 describe('statusHandler', () => {
   it('should return session status', async () => {
@@ -87,21 +84,31 @@ git commit -m "feat: add new feature with tests"
 - 如果是 bug 修复导致测试失败 → 检查测试是否正确，修复代码或测试
 - 如果是重构导致测试失败 → 更新测试以匹配新的实现
 
-## 测试覆盖率目标
+## 测试覆盖率
 
 **当前状态：**
-- 基础测试：飞书连接、会话管理
-- 覆盖率：约 30%
+- 测试框架：Vitest
+- 测试文件：5 个
+- 测试用例：87 个
+- 覆盖率：约 20%
+
+**覆盖详情：**
+| 模块 | 覆盖率 |
+|-----|--------|
+| src/utils/errors.js | 100% |
+| src/config/defaults.js | 100% |
+| src/session/session-storage.js | 82% |
+| src/server/handlers | 60% |
 
 **目标：**
-- 短期（1-2 周）：50%
-- 中期（1-2 月）：70%
+- 短期（1-2 周）：40%
+- 中期（1-2 月）：60%
 - 长期（3 月+）：80%+
 
 **优先级：**
-1. 核心模块：session-manager, session-executor, session-storage
-2. 命令处理器：所有 handlers
-3. 工具模块：logger, errors, validator
+1. 核心模块：session-manager, session-executor, session-storage ✅
+2. 命令处理器：所有 handlers ✅
+3. 工具模块：logger, errors, validator ✅
 4. 集成测试：完整的命令执行流程
 
 ## 测试命令
@@ -110,11 +117,14 @@ git commit -m "feat: add new feature with tests"
 # 运行所有测试
 npm test
 
-# 运行特定测试文件（需要添加测试框架）
-npm test -- test/session/session-manager.test.js
+# 监听模式（开发时使用）
+npm run test:watch
 
-# 查看测试覆盖率（需要配置）
+# 查看测试覆盖率
 npm run test:coverage
+
+# 运行特定测试文件
+npm test -- test/session/session-manager.test.js
 ```
 
 ## 测试最佳实践
@@ -138,6 +148,8 @@ describe('test', () => {
 ### 2. 测试隔离
 ```javascript
 // ✅ 每个测试独立
+import { beforeEach, afterEach } from 'vitest';
+
 beforeEach(() => {
   // 重置状态
   manager = new SessionManager(config);
@@ -155,8 +167,10 @@ const manager = new SessionManager(config); // 全局变量
 ### 3. Mock 外部依赖
 ```javascript
 // ✅ Mock 外部 API
+import { vi } from 'vitest';
+
 const mockFeishu = {
-  sendText: jest.fn().mockResolvedValue({ code: 0 })
+  sendText: vi.fn().mockResolvedValue({ code: 0 })
 };
 
 // ❌ 直接调用真实 API
@@ -175,10 +189,24 @@ it('should handle special characters', () => {});
 it('should work with valid input', () => {});
 ```
 
+## 项目结构
+
+```
+test/
+├── session/
+│   ├── session-manager.test.js   # 会话管理测试
+│   └── session-storage.test.js   # 存储测试
+├── utils/
+│   ├── logger.test.js            # 日志测试
+│   └── errors.test.js            # 错误类测试
+└── handlers/
+    └── handlers.test.js          # 命令处理器测试
+```
+
 ## 持续集成（CI）
 
 **未来计划：**
-- 配置 GitHub Actions 或其他 CI 工具
+- 配置 GitHub Actions
 - 每次 push 自动运行测试
 - Pull Request 必须通过测试才能合并
 - 自动生成测试覆盖率报告
@@ -209,6 +237,8 @@ it('should work with valid input', () => {});
 
 ---
 
-**规则生效日期**: 2026-03-08
-**适用范围**: 所有代码修改
-**强制执行**: 是
+**规则生效日期**: 2026-03-08  
+**最后更新**: 2026-03-11  
+**适用范围**: 所有代码修改  
+**强制执行**: 是  
+**测试框架**: Vitest

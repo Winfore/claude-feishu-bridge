@@ -5,7 +5,7 @@
 
 import Anthropic from '@anthropic-ai/sdk';
 import { readFile, writeFile, mkdir, readdir, unlink, stat, rename } from 'fs/promises';
-import { join, resolve, relative, dirname } from 'path';
+import { join, resolve, relative, dirname, normalize, isAbsolute } from 'path';
 import { existsSync } from 'fs';
 import { glob } from 'glob';
 import { spawn } from 'child_process';
@@ -17,6 +17,7 @@ import { homedir } from 'os';
 import { logger } from '../utils/logger.js';
 import { ToolExecutionError } from '../utils/errors.js';
 import { createSkillTool, executeSkillTool } from '../tools/skill-tool.js';
+import { DEFAULTS } from '../config/defaults.js';
 
 /**
  * 工具定义：Claude 可以调用的工具
@@ -138,7 +139,14 @@ const TOOLS_NEEDING_AUTH = new Set([
 
 export class SessionExecutor {
   constructor(config = {}) {
-    this.model = config.model || 'claude-opus-4-20250514';
+    this.model = config.model || DEFAULTS.model;
+    this.maxTokens = config.maxTokens || DEFAULTS.maxTokens;
+    this.toolTimeout = config.toolTimeout || DEFAULTS.toolTimeout;
+    this.outputLimit = config.outputLimit || DEFAULTS.outputLimit;
+    this.searchFilesLimit = config.searchFilesLimit || DEFAULTS.searchFilesLimit;
+    this.searchContentLimit = config.searchContentLimit || DEFAULTS.searchContentLimit;
+
+    this.onProgress = config.onProgress || (() => {});
 
     // 初始化 Anthropic 客户端
     const apiKey = config.anthropicApiKey || process.env.ANTHROPIC_API_KEY;
@@ -345,6 +353,19 @@ export class SessionExecutor {
   }
 
   /**
+   * 报告执行进度
+   */
+  reportProgress(sessionId, stage, details = {}) {
+    if (this.onProgress) {
+      this.onProgress(sessionId, {
+        stage,
+        timestamp: Date.now(),
+        ...details
+      });
+    }
+  }
+
+  /**
    * 构建系统提示
    */
   buildSystemPrompt(workingDir) {
@@ -382,9 +403,13 @@ export class SessionExecutor {
 
     const absolutePath = params.path ? resolve(workingDir, params.path) : workingDir;
 
-    // 安全检查：确保路径在工作目录内
-    const relativePath = relative(workingDir, absolutePath);
-    if (relativePath.startsWith('..') || absolutePath.startsWith('..')) {
+    // 安全检查：确保路径在工作目录内（规范化后比较）
+    const normalizedWorkingDir = normalize(workingDir);
+    const normalizedAbsolutePath = normalize(absolutePath);
+    const relativePath = relative(normalizedWorkingDir, normalizedAbsolutePath);
+
+    // 如果相对路径以 .. 开头或者是绝对路径（跨盘符），则拒绝
+    if (relativePath.startsWith('..') || isAbsolute(relativePath)) {
       throw new ToolExecutionError(`路径超出工作目录范围: ${params.path}`);
     }
 
@@ -444,9 +469,9 @@ export class SessionExecutor {
       return {
         success: true,
         pattern,
-        files: files.slice(0, 100),
+        files: files.slice(0, this.searchFilesLimit),
         count: files.length,
-        truncated: files.length > 100
+        truncated: files.length > this.searchFilesLimit
       };
     } catch (error) {
       return { success: false, error: error.message };
@@ -469,12 +494,12 @@ export class SessionExecutor {
         maxBuffer: 1024 * 1024
       });
 
-      const lines = stdout.split('\n').filter(l => l.trim()).slice(0, 50);
+      const lines = stdout.split('\n').filter(l => l.trim()).slice(0, this.searchContentLimit);
       return {
         success: true,
         pattern,
         results: lines,
-        truncated: stdout.split('\n').length > 50
+        truncated: stdout.split('\n').length > this.searchContentLimit
       };
     } catch (error) {
       if (error.stdout) {
@@ -521,7 +546,23 @@ export class SessionExecutor {
     }
   }
 
-  async toolExecuteCommand(command, cwd, timeout = 30000) {
+  async toolExecuteCommand(command, cwd, timeout) {
+    timeout = timeout || this.toolTimeout;
+    // 危险命令黑名单
+    const dangerousCommands = [
+      /rm\s+-rf\s+\//,          // rm -rf /
+      /:\(\)\{\s*:\|\:&\s*\};:/, // fork bomb
+      />\s*\/dev\/(sda|hda)/,   // 覆盖磁盘
+      /mkfs/,                    // 格式化
+      /dd\s+if=.*of=\/dev/      // dd 写设备
+    ];
+
+    for (const pattern of dangerousCommands) {
+      if (pattern.test(command)) {
+        return { success: false, error: '危险命令被阻止' };
+      }
+    }
+
     return new Promise((resolve) => {
       const child = spawn(command, [], {
         shell: true,
@@ -539,9 +580,9 @@ export class SessionExecutor {
         resolve({
           success: code === 0,
           exitCode: code,
-          stdout: stdout.slice(0, 10000),
-          stderr: stderr.slice(0, 10000),
-          truncated: stdout.length > 10000 || stderr.length > 10000
+          stdout: stdout.slice(0, this.outputLimit),
+          stderr: stderr.slice(0, this.outputLimit),
+          truncated: stdout.length > this.outputLimit || stderr.length > this.outputLimit
         });
       });
 

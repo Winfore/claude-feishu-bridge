@@ -12,6 +12,7 @@ export class SessionCleanup {
     this.storage = storage;
     this.sessionTimeout = options.sessionTimeout || DEFAULTS.sessionTimeout;
     this.completedSessionCleanupDelay = options.completedSessionCleanupDelay || DEFAULTS.completedSessionCleanupDelay;
+    this.fileRetentionDays = options.fileRetentionDays || DEFAULTS.fileRetentionDays;
     this.cleanupInterval = options.cleanupInterval || DEFAULTS.cleanupInterval;
     this.cleanupTimer = null;
   }
@@ -68,22 +69,27 @@ export class SessionCleanup {
       }
     }
 
-    // 删除会话（包括磁盘文件）
+    // 从内存中移除（保留磁盘文件，下次可自动恢复）
     for (const sessionId of toDelete) {
       this.sessionManager.sessions.delete(sessionId);
       this.sessionManager.pendingAuth.delete(sessionId);
-      await this.storage.deleteSession(sessionId);
+      // 不删除磁盘文件，保留历史供后续恢复
     }
 
     if (toDelete.length > 0) {
-      logger.info(`清理了 ${toDelete.length} 个会话`);
+      logger.info(`从内存清理了 ${toDelete.length} 个会话（磁盘文件保留）`);
     }
   }
 
   /**
-   * 清理过期的持久化文件
+   * 清理过期的磁盘文件（超过保留天数）
    */
-  async cleanupExpiredFiles(maxAge = 7 * 24 * 60 * 60 * 1000) {
-    await this.storage.cleanupExpiredSessions(maxAge);
+  async cleanupExpiredFiles() {
+    const maxAge = this.fileRetentionDays * 24 * 60 * 60 * 1000;
+    const deletedCount = await this.storage.cleanupExpiredSessions(maxAge);
+    if (deletedCount > 0) {
+      logger.info(`清理了 ${deletedCount} 个过期磁盘文件（超过 ${this.fileRetentionDays} 天）`);
+    }
+    return deletedCount;
   }
 }
